@@ -348,7 +348,7 @@ async function getPredictionMessage(chatId, site) {
   if (result.prediction !== "UNKNOWN") {
     message += `🔮 *Prediction: ${result.prediction}*\n📊 Confidence: ${result.confidence}\n🧠 Strategy: ${result.formulaName}\n\n`;
     message += `⚠️ လိုက်ဆပြင်ဆင်ပြီးဆော့ပါ ဆတက်�နိုင်ပါတယ်\n\n`;
-    message += `⚠️ အရင်းရဲ့ 20% နိုင်ရင်နားပါ`;
+    message += `⚠️ အရင်းရဲ့ 20% နိုင်�ရင်နားပါ`;
   } else {
     message += "⚠️ Unable to generate prediction right now.";
   }
