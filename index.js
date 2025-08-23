@@ -67,16 +67,16 @@ const SITE_CONFIGS = {
     issueParams: {
       typeId: 30, 
       language: 0,
-      random: "774d25089b1343f5ba429338c40ea392",
-      signature: "B71A92AF0C016602E261D1B9841E8512"
+      random: "e3da9f7a92a04e6e9802025101f87fdc",
+      signature: "70E65B0221856FCD3CC359934F17A702"
     },
     resultsParams: {
       pageSize: 10, 
       pageNo: 1, 
       typeId: 30, 
       language: 0,
-      random: "02665bc135314581bbed5871dbcafd76",
-      signature: "E378DD1066AF70E7F50A081F2937A4D4"
+      random: "0774ce29cf11408a9c83cc9b5ac99961",
+      signature: "75E50CCCD4EC14DC0FA5FF55C409E96C"
     }
   }
 };
