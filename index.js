@@ -1,9 +1,19 @@
-const https = require('https');
-const http = require('http');
+const TelegramBot = require('node-telegram-bot-api');
+const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 const TOKEN = '7983353841:AAFTdw4_79mqghgn29W5CgAnc01yUz2fIOE'; // Replace with your bot token
+const bot = new TelegramBot(TOKEN, { polling: true });
+
 const SLOT_SECONDS = 30;
-const FIREBASE_URL = "admin-panel-17295-default-rtdb.firebaseio.com";
+const FIREBASE_URL = "https://admin-panel-17295-default-rtdb.firebaseio.com/users";
+
+// Create axios instance with better timeout settings
+const axiosInstance = axios.create({
+  timeout: 15000, // Increased to 15 seconds
+  maxRedirects: 5,
+});
 
 // ===== USER SYSTEM =====
 const verifiedUsers = new Set();
@@ -12,18 +22,29 @@ const userStats = new Map();
 const predictionHistory = new Map(); // Store {issueNumber, prediction, site}
 const keyExpiryTimers = new Map();
 const awaitingKeyRenewal = new Set();
+const userNames = new Map(); // Stores {chatId: userName}
+const awaitingFeedback = new Set(); // Stores chatIds waiting for feedback
 
-// Track if bot is shutting down
-let isShuttingDown = false;
+// Feedback file path
+const FEEDBACK_FILE = path.join(__dirname, 'feedback.json');
+
+// Load existing feedback
+let feedbackData = [];
+try {
+  if (fs.existsSync(FEEDBACK_FILE)) {
+    const data = fs.readFileSync(FEEDBACK_FILE, 'utf8');
+    feedbackData = JSON.parse(data);
+  }
+} catch (err) {
+  console.error('Error loading feedback data:', err.message);
+}
 
 // ===== API CONFIGURATIONS =====
 const SITE_CONFIGS = {
   BIGWIN: {
     name: "BIGWIN",
-    issueUrl: "api.bigwinqaz.com",
-    issuePath: "/api/webapi/GetGameIssue",
-    resultsUrl: "api.bigwinqaz.com",
-    resultsPath: "/api/webapi/GetNoaverageEmerdList",
+    issueUrl: "https://api.bigwinqaz.com/api/webapi/GetGameIssue",
+    resultsUrl: "https://api.bigwinqaz.com/api/webapi/GetNoaverageEmerdList",
     issueParams: {
       typeId: 30, 
       language: 7,
@@ -41,10 +62,8 @@ const SITE_CONFIGS = {
   },
   CKLOTTERY: {
     name: "CK Lottery",
-    issueUrl: "ckygjf6r.com",
-    issuePath: "/api/webapi/GetGameIssue",
-    resultsUrl: "ckygjf6r.com",
-    resultsPath: "/api/webapi/GetNoaverageEmerdList",
+    issueUrl: "https://ckygjf6r.com/api/webapi/GetGameIssue",
+    resultsUrl: "https://ckygjf6r.com/api/webapi/GetNoaverageEmerdList",
     issueParams: {
       typeId: 30, 
       language: 0,
@@ -62,114 +81,42 @@ const SITE_CONFIGS = {
   }
 };
 
-// ===== HTTP REQUEST FUNCTION =====
-function makeRequest(options, postData = null) {
-  return new Promise((resolve, reject) => {
-    const protocol = options.port === 443 ? https : http;
-    const req = protocol.request(options, (res) => {
-      let data = '';
-      
-      res.on('data', (chunk) => {
-        data += chunk;
-      });
-      
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(data));
-        } catch (e) {
-          resolve(data);
-        }
-      });
-    });
-    
-    req.on('error', (error) => {
-      reject(error);
-    });
-    
-    req.setTimeout(options.timeout || 15000, () => {
-      req.destroy();
-      reject(new Error('Request timeout'));
-    });
-    
-    if (postData) {
-      req.write(JSON.stringify(postData));
-    }
-    
-    req.end();
-  });
-}
-
-// ===== TELEGRAM FUNCTIONS =====
-async function sendTelegramMessage(chatId, text, replyMarkup = null) {
-  const options = {
-    hostname: 'api.telegram.org',
-    port: 443,
-    path: `/bot${TOKEN}/sendMessage`,
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    timeout: 10000
-  };
-  
-  const data = {
-    chat_id: chatId,
-    text: text,
-    parse_mode: 'Markdown'
-  };
-  
-  if (replyMarkup) {
-    data.reply_markup = replyMarkup;
-  }
-  
-  try {
-    await makeRequest(options, data);
-    return true;
-  } catch (error) {
-    console.error('Error sending message:', error.message);
-    return false;
-  }
-}
-
-// ===== FIREBASE REST KEY CHECK =====
+// ===== FIREBASE KEY CHECK =====
 async function checkKeyValidity(key, chatId, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
-      console.log(`🔑 Checking key validity for chat: ${chatId} (Attempt ${i+1}/${retries})`);
+      const userName = userNames.get(chatId) || 'Unknown User';
+      console.log(`🔑 Checking key validity for user: ${userName} (Attempt ${i+1}/${retries})`);
       
-      const options = {
-        hostname: FIREBASE_URL,
-        port: 443,
-        path: `/users/${key}.json`,
-        method: 'GET',
+      const res = await axiosInstance.get(`${FIREBASE_URL}/${key}.json`, {
         timeout: 10000
-      };
+      });
       
-      const data = await makeRequest(options);
-      
+      const data = res.data;
       if (!data) {
-        console.log(`❌ Invalid key format for chat: ${chatId}`);
-        return { valid: false, reason: "Invalid Key" };
+        console.log(`❌ Invalid key format for user: ${userName}`);
+        return { valid: false, reason: "Invalid Key\nContact Developer @leostrike223 for key" };
       }
       
       if (Date.now() > data.expiresAt) {
-        console.log(`❌ Expired key for chat: ${chatId}`);
-        return { valid: false, reason: "Expired Key" };
+        console.log(`❌ Expired key for user: ${userName}`);
+        return { valid: false, reason: "Expired Key\nContact Developer @leostrike223 for renewal" };
       }
       
       keyExpiryTimers.set(chatId, data.expiresAt);
 
       const devices = data.devices ? Object.keys(data.devices).length : 0;
       if (devices >= (data.deviceLimit || 1)) {
-        console.log(`❌ Device limit reached for chat: ${chatId}`);
-        return { valid: false, reason: "Device Limit Reached" };
+        console.log(`❌ Device limit reached for user: ${userName}`);
+        return { valid: false, reason: "Device Limit Reached\nContact Developer @leostrike223" };
       }
       
-      console.log(`✅ Valid key for chat: ${chatId}, expires: ${new Date(data.expiresAt).toLocaleString()}`);
+      console.log(`✅ Valid key for user: ${userName}, expires: ${new Date(data.expiresAt).toLocaleString()}`);
       return { valid: true, reason: "Valid" };
       
     } catch (err) {
-      console.error(`❌ Firebase REST Error (Attempt ${i+1}/${retries}) for chat ${chatId}:`, err.message);
+      const userName = userNames.get(chatId) || 'Unknown User';
+      console.error(`❌ Firebase REST Error (Attempt ${i+1}/${retries}) for user ${userName}:`, err.message);
       
       if (i === retries - 1) {
         // Last attempt failed
@@ -177,14 +124,13 @@ async function checkKeyValidity(key, chatId, retries = 3) {
           return { valid: false, reason: "Connection Error: Please try again" };
         } else if (err.code === 'ETIMEDOUT') {
           return { valid: false, reason: "Connection Timeout: Please try again" };
-        } else if (err.message.includes('404')) {
-          return { valid: false, reason: "Invalid Key" };
+        } else if (err.response && err.response.status === 404) {
+          return { valid: false, reason: "Invalid Key\nContact Developer @leostrike223 for key" };
         } else {
           return { valid: false, reason: "Server Error: Please try again later" };
         }
       }
       
-      // Wait before retrying (exponential backoff)
       await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
     }
   }
@@ -194,24 +140,18 @@ async function checkKeyValidity(key, chatId, retries = 3) {
 async function fetchCurrentIssue(site) {
   const config = SITE_CONFIGS[site];
   try {
-    const postData = {
-      ...config.issueParams,
-      timestamp: Math.floor(Date.now() / 1000)
-    };
-    
-    const options = {
-      hostname: config.issueUrl,
-      port: 443,
-      path: config.issuePath,
-      method: 'POST',
-      headers: { 
-        "Content-Type": "application/json; charset=utf-8",
-        "Host": config.issueUrl
-      },
-      timeout: 10000
-    };
-    
-    return await makeRequest(options, postData);
+    const res = await axiosInstance.post(
+      config.issueUrl,
+      {
+        ...config.issueParams,
+        timestamp: Math.floor(Date.now() / 1000)
+      }, 
+      { 
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        timeout: 10000 
+      }
+    );
+    return res.data;
   } catch (err) { 
     console.error(`❌ Error fetching ${site} issue:`, err.message); 
     return null; 
@@ -221,28 +161,21 @@ async function fetchCurrentIssue(site) {
 async function fetchLastResults(site) {
   const config = SITE_CONFIGS[site];
   try {
-    const postData = {
-      ...config.resultsParams,
-      timestamp: Math.floor(Date.now() / 1000)
-    };
+    const res = await axiosInstance.post(
+      config.resultsUrl,
+      {
+        ...config.resultsParams,
+        timestamp: Math.floor(Date.now() / 1000)
+      }, 
+      { 
+        headers: { "Content-Type": "application/json;charset=UTF-8" },
+        timeout: 10000 
+      }
+    );
+
+    if (!res.data?.data?.list) return [];
     
-    const options = {
-      hostname: config.resultsUrl,
-      port: 443,
-      path: config.resultsPath,
-      method: 'POST',
-      headers: { 
-        "Content-Type": "application/json;charset=UTF-8",
-        "Host": config.resultsUrl
-      },
-      timeout: 10000
-    };
-    
-    const res = await makeRequest(options, postData);
-    
-    if (!res?.data?.list) return [];
-    
-    return res.data.list.map(r => {
+    return res.data.data.list.map(r => {
       const num = parseInt(r.result || r.number);
       if (isNaN(num)) return { result: "UNKNOWN", issueNumber: r.issue || r.issueNumber || "UNKNOWN" };
       return { 
@@ -289,7 +222,7 @@ function updateUserStats(chatId, prediction, actualResult, site) {
   
   const userStatsObj = userStats.get(chatId);
   
-  // Ensure the site stats exist
+
   if (!userStatsObj[site]) {
     userStatsObj[site] = { wins: 0, losses: 0, streak: 0, maxStreak: 0 };
   }
@@ -314,7 +247,7 @@ function getUserStats(chatId, site) {
   
   const userStatsObj = userStats.get(chatId);
   
-  // Ensure the site stats exist
+ 
   if (!userStatsObj[site]) {
     userStatsObj[site] = { wins: 0, losses: 0, streak: 0, maxStreak: 0 };
   }
@@ -348,7 +281,7 @@ async function getPredictionMessage(chatId, site) {
   if (result.prediction !== "UNKNOWN") {
     message += `🔮 *Prediction: ${result.prediction}*\n📊 Confidence: ${result.confidence}\n🧠 Strategy: ${result.formulaName}\n\n`;
     message += `⚠️ လိုက်ဆပြင်ဆင်ပြီးဆော့ပါ ဆတက်�နိုင်ပါတယ်\n\n`;
-    message += `⚠️ အရင်းရဲ့ 20% နိုင်�ရင်နားပါ`;
+    message += `⚠️ အရင်းရဲ့ 20% နိုင်ရင်နားပါ`;
   } else {
     message += "⚠️ Unable to generate prediction right now.";
   }
@@ -373,6 +306,36 @@ function getKeyDuration(chatId) {
   return `${minutes}m`;
 }
 
+// ===== USER STATISTICS FUNCTION =====
+function showUserStats() {
+  console.log('\n===== USER STATISTICS =====');
+  console.log(`Total users: ${users.size}`);
+  console.log(`Verified users: ${verifiedUsers.size}`);
+  console.log(`Active subscribers: ${Array.from(users.values()).filter(u => u.subscribed).length}`);
+  
+  console.log('\nUser details:');
+  users.forEach((user, chatId) => {
+    const userName = userNames.get(chatId) || 'Unknown User';
+    const status = verifiedUsers.has(chatId) ? '✅ Verified' : '❌ Unverified';
+    const subscribed = user.subscribed ? '✅ Subscribed' : '❌ Not subscribed';
+    console.log(`${userName}: ${status}, ${subscribed}, Site: ${user.selectedSite}`);
+  });
+  
+  console.log('==========================\n');
+}
+
+// ===== FEEDBACK SYSTEM =====
+function saveFeedback(feedback) {
+  feedbackData.push(feedback);
+  
+  try {
+    fs.writeFileSync(FEEDBACK_FILE, JSON.stringify(feedbackData, null, 2));
+    console.log('✅ Feedback saved successfully');
+  } catch (err) {
+    console.error('❌ Error saving feedback:', err.message);
+  }
+}
+
 // ===== TELEGRAM BOT =====
 function getMainKeyboard(selectedSite) {
   if (selectedSite === "BIGWIN") {
@@ -380,7 +343,8 @@ function getMainKeyboard(selectedSite) {
       keyboard: [
         [{ text: "▶️ START" }, { text: "⏹️ STOP" }],
         [{ text: "🎲 CK LOTTERY" }],
-        [{ text: "⏰ KEY DURATION" }, { text: "🔑 KEYရယူရန်" }]
+        [{ text: "⏰ KEY DURATION" }, { text: "🔑 KEYရယူရန်" }],
+        [{ text: "📝 FEEDBACK" }]
       ], 
       resize_keyboard: true
     };
@@ -389,7 +353,8 @@ function getMainKeyboard(selectedSite) {
       keyboard: [
         [{ text: "▶️ START" }, { text: "⏹️ STOP" }],
         [{ text: "🎰 BIGWIN" }],
-        [{ text: "⏰ KEY DURATION" }, { text: "🔑 KEYရယူရန်" }]
+        [{ text: "⏰ KEY DURATION" }, { text: "🔑 KEYရယူရန်" }],
+        [{ text: "📝 FEEDBACK" }]
       ], 
       resize_keyboard: true
     };
@@ -409,12 +374,9 @@ function getSiteSelectionKeyboard() {
 // ===== KEY EXPIRY CHECK =====
 function checkKeyExpiry() {
   const now = Date.now();
-  let allKeysExpired = true;
   
   for (const [chatId, expiry] of keyExpiryTimers.entries()) {
-    if (now < expiry) {
-      allKeysExpired = false;
-    } else {
+    if (now > expiry) {
       // Key expired for this user
       if (verifiedUsers.has(chatId)) {
         verifiedUsers.delete(chatId);
@@ -422,55 +384,25 @@ function checkKeyExpiry() {
         
         // Send expiry message to user
         try {
-          sendTelegramMessage(chatId, "⛔ KEY IS EXPIRED. Please enter a new key to continue.", {
+          bot.sendMessage(chatId, "⛔ KEY IS EXPIRED. Please enter a new key to continue.", {
             reply_markup: { remove_keyboard: true }
           });
         } catch (err) {
-          console.error(`Error sending expiry message to ${chatId}:`, err.message);
+          const userName = userNames.get(chatId) || 'Unknown User';
+          console.error(`Error sending expiry message to ${userName}:`, err.message);
         }
       }
     }
   }
-  
-  // If all keys are expired, shut down the bot
-  if (allKeysExpired && !isShuttingDown) {
-    isShuttingDown = true;
-    console.log("🛑 All keys expired. Shutting down bot...");
-    
-    // Send shutdown message to all users
-    users.forEach((user, chatId) => {
-      if (user.subscribed) {
-        try {
-          sendTelegramMessage(chatId, "🔴 BOT SHUTDOWN: All keys have expired. The bot will stop functioning.", {
-            reply_markup: { remove_keyboard: true }
-          });
-        } catch (err) {
-          console.error(`Error sending shutdown message to ${chatId}:`, err.message);
-        }
-      }
-    });
-    
-    // Stop the prediction loop
-    clearInterval(predictionInterval);
-    
-    // Exit the process after a delay
-    setTimeout(() => {
-      console.log("✅ Bot shutdown completed");
-      process.exit(0);
-    }, 5000);
-  }
-  
-  return allKeysExpired;
 }
 
-// ===== MESSAGE HANDLING =====
-async function handleStartCommand(chatId) {
-  if (isShuttingDown) {
-    sendTelegramMessage(chatId, "🔴 Bot is shutting down due to expired keys. Please contact the administrator.");
-    return;
-  }
+// ===== BOT COMMANDS =====
+bot.onText(/\/start/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userName = msg.from.first_name || msg.from.username || 'Unknown User';
+  userNames.set(chatId, userName);
   
-  console.log(`🚀 /start command from chat: ${chatId}`);
+  console.log(`🚀 /start command from user: ${userName}`);
   
   if (verifiedUsers.has(chatId)) {
     const expiry = keyExpiryTimers.get(chatId);
@@ -478,26 +410,28 @@ async function handleStartCommand(chatId) {
       const remainingSec = Math.floor((expiry - Date.now()) / 1000);
       if (remainingSec > 0) {
         const user = users.get(chatId) || { selectedSite: "BIGWIN" };
-        sendTelegramMessage(chatId, `🎁 Your key is valid for another ${remainingSec} seconds.\nPredictions will start soon.`, { 
+        bot.sendMessage(chatId, `🎁 Your key is valid for another ${remainingSec} seconds.\nPredictions will start soon.`, { 
           reply_markup: getMainKeyboard(user.selectedSite) 
         });
       } else {
         verifiedUsers.delete(chatId);
         awaitingKeyRenewal.add(chatId);
-        sendTelegramMessage(chatId, "⛔ Your key has expired! Please enter your *new access key* to continue:", { 
+        bot.sendMessage(chatId, "⛔ Your key has expired! Please enter your *new access key* to continue:", { 
           parse_mode: "Markdown" 
         });
       }
     }
   } else {
-    sendTelegramMessage(chatId, "🔑 Please enter your *access key* to activate:", { 
+    bot.sendMessage(chatId, "🔑 Please enter your *access key* to activate:", { 
       parse_mode: "Markdown" 
     });
   }
-}
+});
 
-async function handleStopCommand(chatId) {
-  console.log(`⏹️ /stop command from chat: ${chatId}`);
+bot.onText(/\/stop/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userName = userNames.get(chatId) || 'Unknown User';
+  console.log(`⏹️ /stop command from user: ${userName}`);
   
   if (users.has(chatId)) {
     const user = users.get(chatId);
@@ -507,15 +441,53 @@ async function handleStopCommand(chatId) {
     users.set(chatId, { subscribed: false, selectedSite: "BIGWIN" });
   }
   
-  sendTelegramMessage(chatId, "🛑 Stopped predictions. Use /start or the START button to begin again.", {
+  bot.sendMessage(chatId, "🛑 Stopped predictions. Use /start or the START button to begin again.", {
     reply_markup: { remove_keyboard: true }
   });
-}
+});
 
-async function handleMessage(chatId, text) {
-  if (isShuttingDown) return;
+bot.onText(/\/feedback/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userName = userNames.get(chatId) || 'Unknown User';
+  console.log(`📝 Feedback request from user: ${userName}`);
   
-  console.log(`📩 Message from ${chatId}: ${text}`);
+  awaitingFeedback.add(chatId);
+  bot.sendMessage(chatId, "📝 Feedbackလေးရေးသွားလို့ရပါတယ်ဗျ");
+});
+
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id; 
+  const text = msg.text?.trim() || '';
+  const userName = msg.from.first_name || msg.from.username || 'Unknown User';
+  
+  // Store user name
+  userNames.set(chatId, userName);
+  
+  // Ignore commands and empty messages
+  if (text.startsWith('/') || !text) return;
+  
+  console.log(`📩 Message from ${userName}: ${text}`);
+
+  // Handle feedback
+  if (awaitingFeedback.has(chatId)) {
+    awaitingFeedback.delete(chatId);
+    
+    // Save feedback
+    const feedback = {
+      userId: chatId,
+      userName: userName,
+      message: text,
+      timestamp: new Date().toISOString()
+    };
+    
+    saveFeedback(feedback);
+    console.log(`📝 Feedback from ${userName}: ${text}`);
+    
+    bot.sendMessage(chatId, "ကျေးဇူးတင်ပါသည် 🙏", {
+      reply_markup: getMainKeyboard(users.get(chatId)?.selectedSite || "BIGWIN")
+    });
+    return;
+  }
 
   // Handle site selection
   if (text === "🎰 BIGWIN" || text === "🎲 CK LOTTERY") {
@@ -529,7 +501,7 @@ async function handleMessage(chatId, text) {
       users.set(chatId, user);
     }
     
-    sendTelegramMessage(chatId, `✅ Selected: ${selectedSite}`, {
+    bot.sendMessage(chatId, `✅ Selected: ${selectedSite}`, {
       reply_markup: getMainKeyboard(selectedSite)
     });
     return;
@@ -537,7 +509,18 @@ async function handleMessage(chatId, text) {
 
   // Handle key renewal for expired users
   if (awaitingKeyRenewal.has(chatId) || !verifiedUsers.has(chatId)) {
+    // Send "Checking key" message
+    const checkingMsg = await bot.sendMessage(chatId, "🔑 Key မှန်မမှန်စစ်နေပါသည် ခဏစောင့်ပါ......");
+    
     const result = await checkKeyValidity(text, chatId);
+    
+    // Delete the checking message
+    try {
+      await bot.deleteMessage(chatId, checkingMsg.message_id);
+    } catch (err) {
+      console.error("Error deleting checking message:", err.message);
+    }
+    
     if (result.valid) {
       verifiedUsers.add(chatId);
       awaitingKeyRenewal.delete(chatId);
@@ -555,11 +538,11 @@ async function handleMessage(chatId, text) {
       const remainingSec = Math.floor((expiry - Date.now()) / 1000);
       
       // Ask user to select a site after key activation
-      sendTelegramMessage(chatId, `✅ Key Activated!\n⏳ Valid for another ${remainingSec} seconds.\n\nPlease select your prediction site:`, { 
+      bot.sendMessage(chatId, `✅ Key Activated!\n⏳ Valid for another ${remainingSec} seconds.\n\nPlease select your prediction site:`, { 
         reply_markup: getSiteSelectionKeyboard() 
       });
     } else {
-      sendTelegramMessage(chatId, `❌ Access Denied: ${result.reason}\nEnter a valid key:`);
+      bot.sendMessage(chatId, `❌ Access Denied: ${result.reason}\n\nEnter a valid key or contact @leostrike223 for assistance:`);
     }
     return;
   }
@@ -568,46 +551,52 @@ async function handleMessage(chatId, text) {
   const user = users.get(chatId) || { selectedSite: "BIGWIN" };
   const selectedSite = user.selectedSite;
 
-  if (text === "▶️ START") {
+  if (text.toUpperCase().includes('START')) {
     user.subscribed = true;
     users.set(chatId, user);
-    sendTelegramMessage(chatId, `✅ Subscribed to ${selectedSite} live predictions.`, { 
+    bot.sendMessage(chatId, `✅ Subscribed to ${selectedSite} live predictions.`, { 
       reply_markup: getMainKeyboard(selectedSite) 
     }); 
     return;
   }
   
-  if (text === "⏹️ STOP") {
+  if (text.toUpperCase().includes('STOP')) {
     user.subscribed = false;
     users.set(chatId, user);
-    sendTelegramMessage(chatId, "🛑 Stopped predictions. Use START button to begin again.", { 
+    bot.sendMessage(chatId, "🛑 Stopped predictions. Use START button to begin again.", { 
       reply_markup: getMainKeyboard(selectedSite) 
     }); 
     return;
   }
   
-  if (text === "⏰ KEY DURATION") { 
+  if (text.toUpperCase().includes('KEY DURATION') || text.toUpperCase().includes('DURATION')) { 
     const duration = getKeyDuration(chatId);
-    sendTelegramMessage(chatId, `⏰ Key Duration: ${duration}`, { 
+    bot.sendMessage(chatId, `⏰ Key Duration: ${duration}`, { 
       reply_markup: getMainKeyboard(selectedSite) 
     }); 
     return;
   }
   
-  if (text === "🔑 KEYရယူရန်") {
-    sendTelegramMessage(chatId, "👤 Developer: @leostrike223", { 
+  if (text.toUpperCase().includes('KEYရယူရန်') || text.toUpperCase().includes('KEY')) {
+    bot.sendMessage(chatId, "👤 Developer: @leostrike223", { 
       reply_markup: getMainKeyboard(selectedSite) 
     }); 
     return;
   }
 
+  if (text.toUpperCase().includes('FEEDBACK')) {
+    awaitingFeedback.add(chatId);
+    bot.sendMessage(chatId, "📝 Feedbackလေးရေးသွားလို့ရပါတယ်ဗျ");
+    return;
+  }
+
   // Handle site switching
-  if (text === "🎰 BIGWIN" || text === "🎲 CK LOTTERY") {
-    const newSite = text === "🎰 BIGWIN" ? "BIGWIN" : "CKLOTTERY";
+  if (text.includes("BIGWIN") || text.includes("CK LOTTERY")) {
+    const newSite = text.includes("BIGWIN") ? "BIGWIN" : "CKLOTTERY";
     user.selectedSite = newSite;
     users.set(chatId, user);
     
-    sendTelegramMessage(chatId, `✅ Switched to ${newSite} predictions`, { 
+    bot.sendMessage(chatId, `✅ Switched to ${newSite} predictions`, { 
       reply_markup: getMainKeyboard(newSite) 
     });
     return;
@@ -617,7 +606,7 @@ async function handleMessage(chatId, text) {
   if (!expiry || Date.now() > expiry) {
     verifiedUsers.delete(chatId);
     awaitingKeyRenewal.add(chatId);
-    sendTelegramMessage(chatId, "⛔ KEY IS EXPIRED. Please enter your *new access key* to continue:", { 
+    bot.sendMessage(chatId, "⛔ KEY IS EXPIRED. Please enter your *new access key* to continue:", { 
       parse_mode: "Markdown",
       reply_markup: { remove_keyboard: true }
     });
@@ -625,16 +614,14 @@ async function handleMessage(chatId, text) {
   }
 
   const message = await getPredictionMessage(chatId, selectedSite);
-  sendTelegramMessage(chatId, message, { 
+  bot.sendMessage(chatId, message, { 
     parse_mode: 'Markdown', 
     reply_markup: getMainKeyboard(selectedSite) 
   });
-}
+});
 
 // ===== BROADCAST LOOP =====
 async function broadcastPrediction() {
-  if (isShuttingDown) return;
-  
   console.log("🔔 Starting prediction broadcast cycle");
   
   try {
@@ -644,7 +631,7 @@ async function broadcastPrediction() {
         if (!expiry || Date.now() > expiry) {
           verifiedUsers.delete(chatId);
           awaitingKeyRenewal.add(chatId);
-          sendTelegramMessage(chatId, "⛔ KEY IS EXPIRED. Please enter your *new access key* to continue:", { 
+          bot.sendMessage(chatId, "⛔ KEY IS EXPIRED. Please enter your *new access key* to continue:", { 
             parse_mode: "Markdown",
             reply_markup: { remove_keyboard: true }
           });
@@ -660,13 +647,14 @@ async function broadcastPrediction() {
           }
           
           const latestResult = currentResults[0];
-          console.log(`📊 ${site} Latest result: ${latestResult.result} (${latestResult.actualNumber}) for issue ${latestResult.issueNumber}`);
+          const userName = userNames.get(chatId) || 'Unknown User';
+          console.log(`📊 ${site} Latest result for ${userName}: ${latestResult.result} (${latestResult.actualNumber}) for issue ${latestResult.issueNumber}`);
 
-          // Check if we have a prediction for the previous period that needs to be evaluated
+          // 
           if (predictionHistory.has(chatId)) {
             const lastPrediction = predictionHistory.get(chatId);
             
-            // Only evaluate if it's for the same site
+            // 
             if (lastPrediction.site === site) {
               // Find the result that matches the prediction's issue number
               const matchingResult = currentResults.find(r => r.issueNumber === lastPrediction.issueNumber);
@@ -676,7 +664,7 @@ async function broadcastPrediction() {
                 const outcome = updateUserStats(chatId, lastPrediction.prediction, matchingResult.result, site);
                 
                 // Send simplified Win/Lose notification
-                await sendTelegramMessage(
+                await bot.sendMessage(
                   chatId, 
                   `🎯 Last Prediction (${site}): ${lastPrediction.prediction}\n` +
                   `🎲 Actual Result: ${matchingResult.result} (${matchingResult.actualNumber})\n` +
@@ -689,13 +677,13 @@ async function broadcastPrediction() {
             }
           }
           
-          // Generate new prediction for current period
+          // Generate new prediction
           const predictionResult = await getPredictionForUser(chatId, site);
           if (predictionResult.prediction !== "UNKNOWN") {
             const issue = await fetchCurrentIssue(site);
             const currentIssueNumber = issue?.data?.issueNumber || "Unknown";
             
-            // Store prediction with issue number for future evaluation
+            // Store prediction with issue number for future 
             predictionHistory.set(chatId, {
               prediction: predictionResult.prediction,
               issueNumber: currentIssueNumber,
@@ -705,10 +693,11 @@ async function broadcastPrediction() {
           }
           
           const msg = await getPredictionMessage(chatId, site);
-          await sendTelegramMessage(chatId, msg, { parse_mode: 'Markdown' });
+          await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
           
         } catch (err) {
-          console.error(`❌ Error sending to ${chatId}:`, err.message);
+          const userName = userNames.get(chatId) || 'Unknown User';
+          console.error(`❌ Error sending to ${userName}:`, err.message);
         }
       }
     }
@@ -716,97 +705,19 @@ async function broadcastPrediction() {
     console.error("❌ Error in broadcast prediction cycle:", error.message);
   }
   
-  // Check if all keys have expired
+  // Check if any keys have expired
   checkKeyExpiry();
   
   console.log("✅ Prediction broadcast cycle completed");
 }
 
-// ===== POLLING FOR UPDATES =====
-let lastUpdateId = 0;
-
-async function getUpdates() {
-  if (isShuttingDown) return;
-  
-  try {
-    const options = {
-      hostname: 'api.telegram.org',
-      port: 443,
-      path: `/bot${TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=30`,
-      method: 'GET',
-      timeout: 35000
-    };
-    
-    const response = await makeRequest(options);
-    
-    if (response && response.ok && response.result.length > 0) {
-      for (const update of response.result) {
-        if (update.update_id > lastUpdateId) {
-          lastUpdateId = update.update_id;
-        }
-        
-        if (update.message) {
-          const msg = update.message;
-          const chatId = msg.chat.id;
-          const text = msg.text || '';
-          
-          // Handle commands
-          if (text.startsWith('/start')) {
-            handleStartCommand(chatId);
-          } else if (text.startsWith('/stop')) {
-            handleStopCommand(chatId);
-          } else {
-            handleMessage(chatId, text);
-          }
-        }
-      }
-    }
-  } catch (error) {
-    console.error('Error getting updates:', error.message);
-  }
-  
-  // Continue polling
-  setTimeout(getUpdates, 1000);
-}
-
-// Start the prediction loop
+// Start the prediction 
 const predictionInterval = setInterval(broadcastPrediction, SLOT_SECONDS * 1000);
 
-// Check key expiry every minute
+// Check key expiry
 setInterval(checkKeyExpiry, 60000);
 
-// Start polling for updates
-getUpdates();
-
-// ===== SHUTDOWN =====
-function shutdownHandler() {
-  if (isShuttingDown) return;
-  
-  isShuttingDown = true;
-  console.log("🛑 Shutting down bot...");
-  
-  users.forEach((u, chatId) => { 
-    if (u.subscribed) {
-      try {
-        sendTelegramMessage(chatId, "🚫 Bot stopped by administrator.", {
-          reply_markup: { remove_keyboard: true }
-        });
-      } catch (err) {
-        console.error(`Error sending shutdown message to ${chatId}:`, err.message);
-      }
-    }
-  }); 
-  
-  // Stop the prediction loop
-  clearInterval(predictionInterval);
-  
-  setTimeout(() => {
-    console.log("✅ Bot shutdown completed");
-    process.exit(0);
-  }, 3000);
-}
-
-process.on('SIGINT', shutdownHandler);
-process.on('SIGTERM', shutdownHandler);
+// Show user statistics 
+setInterval(showUserStats, 300000);
 
 console.log("✅ Combined Predictor Pro bot running for BIGWIN and CK Lottery...");
