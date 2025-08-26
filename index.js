@@ -3,7 +3,7 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
-const TOKEN = '7983353841:AAFTdw4_79mqghgn29W5CgAnc01yUz2fIOE'; // Replace with your bot token
+const TOKEN = '7983353841:AAFTdw4_79mqghgn29W5CgAnc01yUz2fIOE';
 const bot = new TelegramBot(TOKEN, { polling: true });
 
 const SLOT_SECONDS = 30;
@@ -11,19 +11,23 @@ const FIREBASE_URL = "https://admin-panel-17295-default-rtdb.firebaseio.com/user
 
 // Create axios instance with better timeout settings
 const axiosInstance = axios.create({
-  timeout: 15000, // Increased to 15 seconds
+  timeout: 15000,
   maxRedirects: 5,
 });
 
 // ===== USER SYSTEM =====
 const verifiedUsers = new Set();
-const users = new Map(); // Stores {chatId: {subscribed: boolean, selectedSite: 'BIGWIN'|'CKLOTTERY'}}
+const users = new Map();
 const userStats = new Map();
-const predictionHistory = new Map(); // Store {issueNumber, prediction, site}
+const predictionHistory = new Map();
 const keyExpiryTimers = new Map();
 const awaitingKeyRenewal = new Set();
-const userNames = new Map(); // Stores {chatId: userName}
-const awaitingFeedback = new Set(); // Stores chatIds waiting for feedback
+const userNames = new Map();
+const awaitingFeedback = new Set();
+const userPredictionHistory = new Map();
+const reversePredictionMode = new Map(); // Track reverse prediction mode for users
+const userStrategy = new Map(); // Track user's selected strategy
+const lossCounters = new Map(); // Track consecutive losses for each user
 
 // Feedback file path
 const FEEDBACK_FILE = path.join(__dirname, 'feedback.json');
@@ -67,16 +71,35 @@ const SITE_CONFIGS = {
     issueParams: {
       typeId: 30, 
       language: 0,
-      random: "e3da9f7a92a04e6e9802025101f87fdc",
-      signature: "70E65B0221856FCD3CC359934F17A702"
+      random: "774d25089b1343f5ba429338c40ea392",
+      signature: "B71A92AF0C016602E261D1B9841E8512"
     },
     resultsParams: {
       pageSize: 10, 
       pageNo: 1, 
       typeId: 30, 
       language: 0,
-      random: "0774ce29cf11408a9c83cc9b5ac99961",
-      signature: "75E50CCCD4EC14DC0FA5FF55C409E96C"
+      random: "02665bc135314581bbed5871dbcafd76",
+      signature: "E378DD1066AF70E7F50A081F2937A4D4"
+    }
+  },
+  '6LOTTERY': {
+    name: "6 Lottery",
+    issueUrl: "https://6lotteryapi.com/api/webapi/GetGameIssue",
+    resultsUrl: "https://6lotteryapi.com/api/webapi/GetNoaverageEmerdList",
+    issueParams: {
+      typeId: 30, 
+      language: 7,
+      random: "ca5c3278bf9a4f03a3d697739ff651d3",
+      signature: "A75B4144E68340E4B5CB0942BC0DC6AD"
+    },
+    resultsParams: {
+      pageSize: 10, 
+      pageNo: 1, 
+      typeId: 30, 
+      language: 7,
+      random: "78ec91eeaea24c7989f0ee62c18c32f4",
+      signature: "9CBCA8B97F6ABE8FCAE8C0BF66126C30"
     }
   }
 };
@@ -119,7 +142,6 @@ async function checkKeyValidity(key, chatId, retries = 3) {
       console.error(`❌ Firebase REST Error (Attempt ${i+1}/${retries}) for user ${userName}:`, err.message);
       
       if (i === retries - 1) {
-        // Last attempt failed
         if (err.code === 'ECONNRESET') {
           return { valid: false, reason: "Connection Error: Please try again" };
         } else if (err.code === 'ETIMEDOUT') {
@@ -147,7 +169,10 @@ async function fetchCurrentIssue(site) {
         timestamp: Math.floor(Date.now() / 1000)
       }, 
       { 
-        headers: { "Content-Type": "application/json; charset=utf-8" },
+        headers: { 
+          "Content-Type": "application/json; charset=utf-8",
+          "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
+        },
         timeout: 10000 
       }
     );
@@ -168,7 +193,10 @@ async function fetchLastResults(site) {
         timestamp: Math.floor(Date.now() / 1000)
       }, 
       { 
-        headers: { "Content-Type": "application/json;charset=UTF-8" },
+        headers: { 
+          "Content-Type": "application/json; charset=utf-8",
+          "User-Agent": "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36"
+        },
         timeout: 10000 
       }
     );
@@ -211,18 +239,36 @@ function countStrategy(results) {
   return null;
 }
 
+function majorityStrategy(results) {
+  let bigCount = 0;
+  let smallCount = 0;
+  
+  results.forEach(r => {
+    if (r === "BIG") bigCount++;
+    if (r === "SMALL") smallCount++;
+  });
+  
+  if (bigCount > smallCount) {
+    return { prediction: "SMALL", formulaName: "Pai's Strategy", confidence: "Medium", calculation: `${bigCount}B > ${smallCount}S = Small` };
+  } else if (smallCount > bigCount) {
+    return { prediction: "BIG", formulaName: "Pai's Strategy", confidence: "Medium", calculation: `${smallCount}S > ${bigCount}B = Big` };
+  } else {
+    return { prediction: "BIG", formulaName: "Pai's Strategy", confidence: "Low", calculation: `${bigCount}B = ${smallCount}S = Default Big` };
+  }
+}
+
 // ===== WIN/LOSE TRACKING =====
 function updateUserStats(chatId, prediction, actualResult, site) {
   if (!userStats.has(chatId)) {
     userStats.set(chatId, { 
       [SITE_CONFIGS.BIGWIN.name]: { wins: 0, losses: 0, streak: 0, maxStreak: 0 },
-      [SITE_CONFIGS.CKLOTTERY.name]: { wins: 0, losses: 0, streak: 0, maxStreak: 0 }
+      [SITE_CONFIGS.CKLOTTERY.name]: { wins: 0, losses: 0, streak: 0, maxStreak: 0 },
+      [SITE_CONFIGS['6LOTTERY'].name]: { wins: 0, losses: 0, streak: 0, maxStreak: 0 }
     });
   }
   
   const userStatsObj = userStats.get(chatId);
   
-
   if (!userStatsObj[site]) {
     userStatsObj[site] = { wins: 0, losses: 0, streak: 0, maxStreak: 0 };
   }
@@ -232,10 +278,28 @@ function updateUserStats(chatId, prediction, actualResult, site) {
     stats.wins++; 
     stats.streak++; 
     if (stats.streak > stats.maxStreak) stats.maxStreak = stats.streak; 
+    
+    // Reset loss counter and reverse prediction mode after a win
+    lossCounters.set(chatId, 0);
+    if (reversePredictionMode.has(chatId)) {
+      reversePredictionMode.delete(chatId);
+    }
+    
     return "WIN"; 
   } else { 
     stats.losses++; 
     stats.streak = 0; 
+    
+    // Update loss counter
+    const currentLosses = lossCounters.get(chatId) || 0;
+    lossCounters.set(chatId, currentLosses + 1);
+    
+    // Enable reverse prediction mode after 2 losses for Pai's Strategy
+    const strategy = userStrategy.get(chatId) || "KOZAW";
+    if (strategy === "PAI" && currentLosses + 1 >= 2) {
+      reversePredictionMode.set(chatId, true);
+    }
+    
     return "LOSE"; 
   }
 }
@@ -247,7 +311,6 @@ function getUserStats(chatId, site) {
   
   const userStatsObj = userStats.get(chatId);
   
- 
   if (!userStatsObj[site]) {
     userStatsObj[site] = { wins: 0, losses: 0, streak: 0, maxStreak: 0 };
   }
@@ -261,12 +324,36 @@ async function getPredictionForUser(chatId, site) {
   const results = (await fetchLastResults(site)).map(r => r.result);
   if (!results.length) return { prediction: "UNKNOWN" };
   
-  const strategy = countStrategy(results);
+  const strategyType = userStrategy.get(chatId) || "KOZAW";
+  let strategy;
+  
+  if (strategyType === "KOZAW") {
+    strategy = countStrategy(results);
+  } else {
+    strategy = majorityStrategy(results);
+  }
+  
   if (strategy) {
+    // Check if we should reverse the prediction
+    if (reversePredictionMode.has(chatId)) {
+      return {
+        prediction: strategy.prediction === "BIG" ? "SMALL" : "BIG",
+        formulaName: strategy.formulaName,
+        confidence: strategy.confidence,
+        calculation: `Reversed: ${strategy.prediction} → ${strategy.prediction === "BIG" ? "SMALL" : "BIG"}`
+      };
+    }
     return strategy;
   }
   
-  return { prediction: "BIG", formulaName: "KoZaw's Strategy", confidence: "Low", calculation: "No clear pattern detected" };
+  // Default prediction
+  let defaultPrediction = { prediction: "BIG", formulaName: "KoZaw's Strategy", confidence: "Low", calculation: "No clear pattern detected" };
+  
+  if (strategyType === "PAI") {
+    defaultPrediction = { prediction: "BIG", formulaName: "Pai's Strategy", confidence: "Low", calculation: "No clear pattern detected" };
+  }
+  
+  return defaultPrediction;
 }
 
 async function getPredictionMessage(chatId, site) {
@@ -280,7 +367,7 @@ async function getPredictionMessage(chatId, site) {
   
   if (result.prediction !== "UNKNOWN") {
     message += `🔮 *Prediction: ${result.prediction}*\n📊 Confidence: ${result.confidence}\n🧠 Strategy: ${result.formulaName}\n\n`;
-    message += `⚠️ လိုက်ဆပြင်ဆင်ပြီးဆော့ပါ ဆတက်�နိုင်ပါတယ်\n\n`;
+    message += `⚠️ လိုက်ဆပြင်ဆင်ပြီးဆော့ပါ ဆတက် နိုင်ပါတယ်\n\n`;
     message += `⚠️ အရင်းရဲ့ 20% နိုင်ရင်နားပါ`;
   } else {
     message += "⚠️ Unable to generate prediction right now.";
@@ -312,13 +399,16 @@ function showUserStats() {
   console.log(`Total users: ${users.size}`);
   console.log(`Verified users: ${verifiedUsers.size}`);
   console.log(`Active subscribers: ${Array.from(users.values()).filter(u => u.subscribed).length}`);
+  console.log(`Users in reverse mode: ${reversePredictionMode.size}`);
   
   console.log('\nUser details:');
   users.forEach((user, chatId) => {
     const userName = userNames.get(chatId) || 'Unknown User';
     const status = verifiedUsers.has(chatId) ? '✅ Verified' : '❌ Unverified';
     const subscribed = user.subscribed ? '✅ Subscribed' : '❌ Not subscribed';
-    console.log(`${userName}: ${status}, ${subscribed}, Site: ${user.selectedSite}`);
+    const reverseMode = reversePredictionMode.has(chatId) ? '🔄 Reverse' : '➡️ Normal';
+    const strategy = userStrategy.get(chatId) || 'KOZAW';
+    console.log(`${userName}: ${status}, ${subscribed}, ${reverseMode}, Strategy: ${strategy}, Site: ${user.selectedSite}`);
   });
   
   console.log('==========================\n');
@@ -336,15 +426,61 @@ function saveFeedback(feedback) {
   }
 }
 
+// ===== PREDICTION HISTORY SYSTEM =====
+function addToPredictionHistory(chatId, predictionData) {
+  if (!userPredictionHistory.has(chatId)) {
+    userPredictionHistory.set(chatId, {
+      BIGWIN: [],
+      CKLOTTERY: [],
+      '6LOTTERY': []
+    });
+  }
+  
+  const historyObj = userPredictionHistory.get(chatId);
+  const siteHistory = historyObj[predictionData.site] || [];
+  siteHistory.unshift(predictionData);
+  
+  if (siteHistory.length > 20) {
+    siteHistory.pop();
+  }
+  
+  historyObj[predictionData.site] = siteHistory;
+  userPredictionHistory.set(chatId, historyObj);
+}
+
+function getLastPredictions(chatId, site, count = 20) {
+  if (!userPredictionHistory.has(chatId)) {
+    return [];
+  }
+  
+  const historyObj = userPredictionHistory.get(chatId);
+  const siteHistory = historyObj[site] || [];
+  return siteHistory.slice(0, count);
+}
+
 // ===== TELEGRAM BOT =====
-function getMainKeyboard(selectedSite) {
+function getMainKeyboard(selectedSite, strategy = "KOZAW") {
+  const strategyButton = strategy === "KOZAW" ? "🧠 Pai's Strategy" : "🧠 KoZaw's Strategy";
+  
   if (selectedSite === "BIGWIN") {
     return {
       keyboard: [
         [{ text: "▶️ START" }, { text: "⏹️ STOP" }],
-        [{ text: "🎲 CK LOTTERY" }],
+        [{ text: "🎲 CK LOTTERY" }, { text: "🎯 6 LOTTERY" }],
         [{ text: "⏰ KEY DURATION" }, { text: "🔑 KEYရယူရန်" }],
-        [{ text: "📝 FEEDBACK" }]
+        [{ text: "📊 PREDICTION HISTORY" }, { text: "📝 FEEDBACK" }],
+        [{ text: strategyButton }]
+      ], 
+      resize_keyboard: true
+    };
+  } else if (selectedSite === "CKLOTTERY") {
+    return {
+      keyboard: [
+        [{ text: "▶️ START" }, { text: "⏹️ STOP" }],
+        [{ text: "🎰 BIGWIN" }, { text: "🎯 6 LOTTERY" }],
+        [{ text: "⏰ KEY DURATION" }, { text: "🔑 KEYရယူရန်" }],
+        [{ text: "📊 PREDICTION HISTORY" }, { text: "📝 FEEDBACK" }],
+        [{ text: strategyButton }]
       ], 
       resize_keyboard: true
     };
@@ -352,9 +488,10 @@ function getMainKeyboard(selectedSite) {
     return {
       keyboard: [
         [{ text: "▶️ START" }, { text: "⏹️ STOP" }],
-        [{ text: "🎰 BIGWIN" }],
+        [{ text: "🎰 BIGWIN" }, { text: "🎲 CK LOTTERY" }],
         [{ text: "⏰ KEY DURATION" }, { text: "🔑 KEYရယူရန်" }],
-        [{ text: "📝 FEEDBACK" }]
+        [{ text: "📊 PREDICTION HISTORY" }, { text: "📝 FEEDBACK" }],
+        [{ text: strategyButton }]
       ], 
       resize_keyboard: true
     };
@@ -364,7 +501,7 @@ function getMainKeyboard(selectedSite) {
 function getSiteSelectionKeyboard() {
   return {
     keyboard: [
-      [{ text: "🎰 BIGWIN" }, { text: "🎲 CK LOTTERY" }]
+      [{ text: "🎰 BIGWIN" }, { text: "🎲 CK LOTTERY" }, { text: "🎯 6 LOTTERY" }]
     ],
     resize_keyboard: true,
     one_time_keyboard: true
@@ -377,12 +514,18 @@ function checkKeyExpiry() {
   
   for (const [chatId, expiry] of keyExpiryTimers.entries()) {
     if (now > expiry) {
-      // Key expired for this user
       if (verifiedUsers.has(chatId)) {
         verifiedUsers.delete(chatId);
         awaitingKeyRenewal.add(chatId);
         
-        // Send expiry message to user
+        // Clear reverse prediction mode and loss counter when key expires
+        if (reversePredictionMode.has(chatId)) {
+          reversePredictionMode.delete(chatId);
+        }
+        if (lossCounters.has(chatId)) {
+          lossCounters.delete(chatId);
+        }
+        
         try {
           bot.sendMessage(chatId, "⛔ KEY IS EXPIRED. Please enter a new key to continue.", {
             reply_markup: { remove_keyboard: true }
@@ -404,14 +547,20 @@ bot.onText(/\/start/, async (msg) => {
   
   console.log(`🚀 /start command from user: ${userName}`);
   
+  // Set default strategy if not set
+  if (!userStrategy.has(chatId)) {
+    userStrategy.set(chatId, "KOZAW");
+  }
+  
   if (verifiedUsers.has(chatId)) {
     const expiry = keyExpiryTimers.get(chatId);
     if (expiry) {
       const remainingSec = Math.floor((expiry - Date.now()) / 1000);
       if (remainingSec > 0) {
         const user = users.get(chatId) || { selectedSite: "BIGWIN" };
+        const strategy = userStrategy.get(chatId) || "KOZAW";
         bot.sendMessage(chatId, `🎁 Your key is valid for another ${remainingSec} seconds.\nPredictions will start soon.`, { 
-          reply_markup: getMainKeyboard(user.selectedSite) 
+          reply_markup: getMainKeyboard(user.selectedSite, strategy) 
         });
       } else {
         verifiedUsers.delete(chatId);
@@ -455,24 +604,55 @@ bot.onText(/\/feedback/, async (msg) => {
   bot.sendMessage(chatId, "📝 Feedbackလေးရေးသွားလို့ရပါတယ်ဗျ");
 });
 
+bot.onText(/\/history/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userName = userNames.get(chatId) || 'Unknown User';
+  console.log(`📊 History request from user: ${userName}`);
+  
+  if (!verifiedUsers.has(chatId)) {
+    bot.sendMessage(chatId, "🔒 Please activate your key first using /start");
+    return;
+  }
+  
+  const user = users.get(chatId) || { selectedSite: "BIGWIN" };
+  const predictions = getLastPredictions(chatId, user.selectedSite, 20);
+  
+  if (predictions.length === 0) {
+    const strategy = userStrategy.get(chatId) || "KOZAW";
+    bot.sendMessage(chatId, "📊 No prediction history available yet.", {
+      reply_markup: getMainKeyboard(user.selectedSite, strategy)
+    });
+    return;
+  }
+  
+  let message = `📊 *Last ${predictions.length} Predictions for ${SITE_CONFIGS[user.selectedSite].name}*\n\n`;
+  
+  predictions.forEach((pred, index) => {
+    const outcome = pred.outcome ? (pred.outcome === "WIN" ? "✅" : "❌") : "⏳";
+    message += `${index + 1}. Period: ${pred.issueNumber} - ${outcome}\n`;
+  });
+  
+  const strategy = userStrategy.get(chatId) || "KOZAW";
+  bot.sendMessage(chatId, message, {
+    parse_mode: 'Markdown',
+    reply_markup: getMainKeyboard(user.selectedSite, strategy)
+  });
+});
+
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id; 
   const text = msg.text?.trim() || '';
   const userName = msg.from.first_name || msg.from.username || 'Unknown User';
   
-  // Store user name
   userNames.set(chatId, userName);
   
-  // Ignore commands and empty messages
   if (text.startsWith('/') || !text) return;
   
   console.log(`📩 Message from ${userName}: ${text}`);
 
-  // Handle feedback
   if (awaitingFeedback.has(chatId)) {
     awaitingFeedback.delete(chatId);
     
-    // Save feedback
     const feedback = {
       userId: chatId,
       userName: userName,
@@ -483,15 +663,19 @@ bot.on('message', async (msg) => {
     saveFeedback(feedback);
     console.log(`📝 Feedback from ${userName}: ${text}`);
     
+    const user = users.get(chatId) || { selectedSite: "BIGWIN" };
+    const strategy = userStrategy.get(chatId) || "KOZAW";
     bot.sendMessage(chatId, "ကျေးဇူးတင်ပါသည် 🙏", {
-      reply_markup: getMainKeyboard(users.get(chatId)?.selectedSite || "BIGWIN")
+      reply_markup: getMainKeyboard(user.selectedSite, strategy)
     });
     return;
   }
 
-  // Handle site selection
-  if (text === "🎰 BIGWIN" || text === "🎲 CK LOTTERY") {
-    const selectedSite = text === "🎰 BIGWIN" ? "BIGWIN" : "CKLOTTERY";
+  if (text === "🎰 BIGWIN" || text === "🎲 CK LOTTERY" || text === "🎯 6 LOTTERY") {
+    let selectedSite;
+    if (text === "🎰 BIGWIN") selectedSite = "BIGWIN";
+    else if (text === "🎲 CK LOTTERY") selectedSite = "CKLOTTERY";
+    else selectedSite = "6LOTTERY";
     
     if (!users.has(chatId)) {
       users.set(chatId, { subscribed: false, selectedSite });
@@ -501,20 +685,37 @@ bot.on('message', async (msg) => {
       users.set(chatId, user);
     }
     
-    bot.sendMessage(chatId, `✅ Selected: ${selectedSite}`, {
-      reply_markup: getMainKeyboard(selectedSite)
+    const strategy = userStrategy.get(chatId) || "KOZAW";
+    bot.sendMessage(chatId, `✅ Selected: ${SITE_CONFIGS[selectedSite].name}`, {
+      reply_markup: getMainKeyboard(selectedSite, strategy)
     });
     return;
   }
 
-  // Handle key renewal for expired users
+  if (text === "🧠 KoZaw's Strategy" || text === "🧠 Pai's Strategy") {
+    const newStrategy = text === "🧠 KoZaw's Strategy" ? "KOZAW" : "PAI";
+    userStrategy.set(chatId, newStrategy);
+    
+    // Reset reverse mode and loss counter when switching strategies
+    if (reversePredictionMode.has(chatId)) {
+      reversePredictionMode.delete(chatId);
+    }
+    if (lossCounters.has(chatId)) {
+      lossCounters.delete(chatId);
+    }
+    
+    const user = users.get(chatId) || { selectedSite: "BIGWIN" };
+    bot.sendMessage(chatId, `✅ Strategy changed to: ${newStrategy === "KOZAW" ? "KoZaw's Strategy" : "Pai's Strategy"}`, {
+      reply_markup: getMainKeyboard(user.selectedSite, newStrategy)
+    });
+    return;
+  }
+
   if (awaitingKeyRenewal.has(chatId) || !verifiedUsers.has(chatId)) {
-    // Send "Checking key" message
     const checkingMsg = await bot.sendMessage(chatId, "🔑 Key မှန်မမှန်စစ်နေပါသည် ခဏစောင့်ပါ......");
     
     const result = await checkKeyValidity(text, chatId);
     
-    // Delete the checking message
     try {
       await bot.deleteMessage(chatId, checkingMsg.message_id);
     } catch (err) {
@@ -525,7 +726,6 @@ bot.on('message', async (msg) => {
       verifiedUsers.add(chatId);
       awaitingKeyRenewal.delete(chatId);
       
-      // Initialize user with default site if not exists
       if (!users.has(chatId)) {
         users.set(chatId, { subscribed: true, selectedSite: "BIGWIN" });
       } else {
@@ -534,10 +734,14 @@ bot.on('message', async (msg) => {
         users.set(chatId, user);
       }
       
+      // Set default strategy if not set
+      if (!userStrategy.has(chatId)) {
+        userStrategy.set(chatId, "KOZAW");
+      }
+      
       const expiry = keyExpiryTimers.get(chatId);
       const remainingSec = Math.floor((expiry - Date.now()) / 1000);
       
-      // Ask user to select a site after key activation
       bot.sendMessage(chatId, `✅ Key Activated!\n⏳ Valid for another ${remainingSec} seconds.\n\nPlease select your prediction site:`, { 
         reply_markup: getSiteSelectionKeyboard() 
       });
@@ -547,15 +751,15 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // Get user's selected site
   const user = users.get(chatId) || { selectedSite: "BIGWIN" };
   const selectedSite = user.selectedSite;
+  const strategy = userStrategy.get(chatId) || "KOZAW";
 
   if (text.toUpperCase().includes('START')) {
     user.subscribed = true;
     users.set(chatId, user);
-    bot.sendMessage(chatId, `✅ Subscribed to ${selectedSite} live predictions.`, { 
-      reply_markup: getMainKeyboard(selectedSite) 
+    bot.sendMessage(chatId, `✅ Subscribed to ${SITE_CONFIGS[selectedSite].name} live predictions.`, { 
+      reply_markup: getMainKeyboard(selectedSite, strategy) 
     }); 
     return;
   }
@@ -564,7 +768,7 @@ bot.on('message', async (msg) => {
     user.subscribed = false;
     users.set(chatId, user);
     bot.sendMessage(chatId, "🛑 Stopped predictions. Use START button to begin again.", { 
-      reply_markup: getMainKeyboard(selectedSite) 
+      reply_markup: getMainKeyboard(selectedSite, strategy) 
     }); 
     return;
   }
@@ -572,14 +776,14 @@ bot.on('message', async (msg) => {
   if (text.toUpperCase().includes('KEY DURATION') || text.toUpperCase().includes('DURATION')) { 
     const duration = getKeyDuration(chatId);
     bot.sendMessage(chatId, `⏰ Key Duration: ${duration}`, { 
-      reply_markup: getMainKeyboard(selectedSite) 
+      reply_markup: getMainKeyboard(selectedSite, strategy) 
     }); 
     return;
   }
   
   if (text.toUpperCase().includes('KEYရယူရန်') || text.toUpperCase().includes('KEY')) {
     bot.sendMessage(chatId, "👤 Developer: @leostrike223", { 
-      reply_markup: getMainKeyboard(selectedSite) 
+      reply_markup: getMainKeyboard(selectedSite, strategy) 
     }); 
     return;
   }
@@ -590,14 +794,46 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // Handle site switching
-  if (text.includes("BIGWIN") || text.includes("CK LOTTERY")) {
-    const newSite = text.includes("BIGWIN") ? "BIGWIN" : "CKLOTTERY";
+  if (text.toUpperCase().includes('PREDICTION HISTORY') || text.toUpperCase().includes('HISTORY')) {
+    if (!verifiedUsers.has(chatId)) {
+      bot.sendMessage(chatId, "🔒 Please activate your key first using /start");
+      return;
+    }
+    
+    const predictions = getLastPredictions(chatId, selectedSite, 20);
+    
+    if (predictions.length === 0) {
+      bot.sendMessage(chatId, "📊 No prediction history available yet.", {
+        reply_markup: getMainKeyboard(selectedSite, strategy)
+      });
+      return;
+    }
+    
+    let message = `📊 *Last ${predictions.length} Predictions for ${SITE_CONFIGS[selectedSite].name}*\n\n`;
+    
+    predictions.forEach((pred, index) => {
+      const outcome = pred.outcome ? (pred.outcome === "WIN" ? "✅" : "❌") : "⏳";
+      message += `${index + 1}. Period: ${pred.issueNumber} - ${outcome}\n`;
+    });
+    
+    bot.sendMessage(chatId, message, {
+      parse_mode: 'Markdown',
+      reply_markup: getMainKeyboard(selectedSite, strategy)
+    });
+    return;
+  }
+
+  if (text.includes("BIGWIN") || text.includes("CK LOTTERY") || text.includes("6 LOTTERY")) {
+    let newSite;
+    if (text.includes("BIGWIN")) newSite = "BIGWIN";
+    else if (text.includes("CK LOTTERY")) newSite = "CKLOTTERY";
+    else newSite = "6LOTTERY";
+    
     user.selectedSite = newSite;
     users.set(chatId, user);
     
-    bot.sendMessage(chatId, `✅ Switched to ${newSite} predictions`, { 
-      reply_markup: getMainKeyboard(newSite) 
+    bot.sendMessage(chatId, `✅ Switched to ${SITE_CONFIGS[newSite].name} predictions`, { 
+      reply_markup: getMainKeyboard(newSite, strategy) 
     });
     return;
   }
@@ -616,7 +852,7 @@ bot.on('message', async (msg) => {
   const message = await getPredictionMessage(chatId, selectedSite);
   bot.sendMessage(chatId, message, { 
     parse_mode: 'Markdown', 
-    reply_markup: getMainKeyboard(selectedSite) 
+    reply_markup: getMainKeyboard(selectedSite, strategy) 
   });
 });
 
@@ -650,74 +886,112 @@ async function broadcastPrediction() {
           const userName = userNames.get(chatId) || 'Unknown User';
           console.log(`📊 ${site} Latest result for ${userName}: ${latestResult.result} (${latestResult.actualNumber}) for issue ${latestResult.issueNumber}`);
 
-          // 
           if (predictionHistory.has(chatId)) {
             const lastPrediction = predictionHistory.get(chatId);
             
-            // 
             if (lastPrediction.site === site) {
-              // Find the result that matches the prediction's issue number
               const matchingResult = currentResults.find(r => r.issueNumber === lastPrediction.issueNumber);
               
               if (matchingResult) {
-                // We have a result for the predicted period
                 const outcome = updateUserStats(chatId, lastPrediction.prediction, matchingResult.result, site);
                 
-                // Send simplified Win/Lose notification
-                await bot.sendMessage(
-                  chatId, 
-                  `🎯 Last Prediction (${site}): ${lastPrediction.prediction}\n` +
-                  `🎲 Actual Result: ${matchingResult.result} (${matchingResult.actualNumber})\n` +
-                  `📊 Outcome: ${outcome === "WIN" ? "✅ WIN!" : "❌ LOSE"}`
-                );
+                const historyPrediction = {
+                  prediction: lastPrediction.prediction,
+                  issueNumber: lastPrediction.issueNumber,
+                  timestamp: lastPrediction.timestamp,
+                  outcome: outcome,
+                  actualResult: matchingResult.result,
+                  site: site
+                };
                 
-                // Remove the evaluated prediction
+                addToPredictionHistory(chatId, historyPrediction);
+                
+                let resultMessage = `🎯 *${site} Result*\n`;
+                resultMessage += `📅 Period: \`${matchingResult.issueNumber}\`\n`;
+                resultMessage += `🔮 Last Prediction: ${lastPrediction.prediction}\n`;
+                resultMessage += `🎲 Actual Result: ${matchingResult.result}\n`;
+                resultMessage += `📊 Outcome: ${outcome === "WIN" ? "✅ WIN" : "❌ LOSE"}`;
+                
+                const strategy = userStrategy.get(chatId) || "KOZAW";
+                bot.sendMessage(chatId, resultMessage, { 
+                  parse_mode: 'Markdown',
+                  reply_markup: getMainKeyboard(site, strategy)
+                });
+                
                 predictionHistory.delete(chatId);
               }
             }
           }
           
-          // Generate new prediction
-          const predictionResult = await getPredictionForUser(chatId, site);
-          if (predictionResult.prediction !== "UNKNOWN") {
-            const issue = await fetchCurrentIssue(site);
-            const currentIssueNumber = issue?.data?.issueNumber || "Unknown";
-            
-            // Store prediction with issue number for future 
-            predictionHistory.set(chatId, {
-              prediction: predictionResult.prediction,
-              issueNumber: currentIssueNumber,
-              timestamp: Date.now(),
-              site: site
-            });
+          const issue = await fetchCurrentIssue(site);
+          if (!issue?.data?.issueNumber) {
+            console.log(`⚠️ No ${site} issue data available`);
+            continue;
           }
           
-          const msg = await getPredictionMessage(chatId, site);
-          await bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+          const prediction = await getPredictionForUser(chatId, site);
           
+          if (prediction.prediction !== "UNKNOWN") {
+            const predictionData = {
+              prediction: prediction.prediction,
+              issueNumber: issue.data.issueNumber,
+              timestamp: Date.now(),
+              site: site
+            };
+            
+            predictionHistory.set(chatId, predictionData);
+            
+            const now = new Date();
+            const clock = now.toLocaleTimeString('en-US', { hour12: true });
+            
+            let message = `🎰 *${site} Predictor Pro*\n`;
+            message += `📅 Period: \`${issue.data.issueNumber}\`\n`;
+            message += `🕒 ${clock}\n\n`;
+            message += `🔮 *Prediction: ${prediction.prediction}*\n`;
+            message += `📊 Confidence: ${prediction.confidence}\n`;
+            message += `🧠 Strategy: ${prediction.formulaName}\n\n`;
+            
+            message += `⚠️ လိုက်ဆပြင်ဆင်ပြီးဆော့ပါ ဆတက် နိုင်ပါတယ်\n\n`;
+            message += `⚠️ အရင်းရဲ့ 20% နိုင်ရင်နားပါ`;
+            
+            const strategy = userStrategy.get(chatId) || "KOZAW";
+            bot.sendMessage(chatId, message, { 
+              parse_mode: 'Markdown',
+              reply_markup: getMainKeyboard(site, strategy)
+            });
+          }
         } catch (err) {
           const userName = userNames.get(chatId) || 'Unknown User';
-          console.error(`❌ Error sending to ${userName}:`, err.message);
+          console.error(`❌ Error sending prediction to ${userName}:`, err.message);
         }
+        
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
     }
-  } catch (error) {
-    console.error("❌ Error in broadcast prediction cycle:", error.message);
+  } catch (err) {
+    console.error("❌ Error in broadcast loop:", err.message);
   }
-  
-  // Check if any keys have expired
-  checkKeyExpiry();
   
   console.log("✅ Prediction broadcast cycle completed");
 }
 
-// Start the prediction 
-const predictionInterval = setInterval(broadcastPrediction, SLOT_SECONDS * 1000);
+// ===== STARTUP =====
+console.log("🤖 Starting Lottery Prediction Bot...");
+console.log("📊 Initial user statistics:");
+showUserStats();
 
-// Check key expiry
+// ===== INTERVALS =====
+setInterval(broadcastPrediction, SLOT_SECONDS * 1000);
 setInterval(checkKeyExpiry, 60000);
-
-// Show user statistics 
 setInterval(showUserStats, 300000);
 
-console.log("✅ Combined Predictor Pro bot running for BIGWIN and CK Lottery...");
+// ===== ERROR HANDLING =====
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught Exception:', err.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+console.log("✅ Bot is now running and ready to accept commands!");
