@@ -1,12 +1,12 @@
-const TelegramBot = require('node-telegram-bot-api');
+8021091374:AAG70AOGpks_IUBwQ4zOIIrPDGXjuiOafmUconst TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
-const TOKEN = '7983353841:AAFTdw4_79mqghgn29W5CgAnc01yUz2fIOE';
+const TOKEN = '8021091374:AAG70AOGpks_IUBwQ4zOIIrPDGXjuiOafmU';
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-const SLOT_SECONDS = 30;
+const SLOT_SECONDS = 60;
 const FIREBASE_URL = "https://admin-panel-17295-default-rtdb.firebaseio.com/users";
 
 // Create axios instance with better timeout settings
@@ -50,18 +50,18 @@ const SITE_CONFIGS = {
     issueUrl: "https://api.bigwinqaz.com/api/webapi/GetGameIssue",
     resultsUrl: "https://api.bigwinqaz.com/api/webapi/GetNoaverageEmerdList",
     issueParams: {
-      typeId: 30, 
+      typeId: 1, 
       language: 7,
-      random: "261a65ff89cf41b0aa6d41d9d90325b0",
-      signature: "8F29D6BBF728613DD4BB349D5175AD15"
+      random: "781595e240774af2a0b358a9a5d1635f",
+      signature: "78F415D9A984527F16EB7C3516161C99"
     },
     resultsParams: {
       pageSize: 10, 
       pageNo: 1, 
-      typeId: 30, 
+      typeId: 1, 
       language: 7,
-      random: "248642421cd847fbbf3d33630ee82d5e",
-      signature: "FE3C4A5BD61772C9B727C1553CA60ACC"
+      random: "166924cfd7b444b88234dc96d94f6ab0",
+      signature: "FF67F22F5611BC68E513899DBC5A0A72"
     }
   },
   CKLOTTERY: {
@@ -69,18 +69,18 @@ const SITE_CONFIGS = {
     issueUrl: "https://ckygjf6r.com/api/webapi/GetGameIssue",
     resultsUrl: "https://ckygjf6r.com/api/webapi/GetNoaverageEmerdList",
     issueParams: {
-      typeId: 30, 
+      typeId: 1, 
       language: 0,
-      random: "774d25089b1343f5ba429338c40ea392",
-      signature: "B71A92AF0C016602E261D1B9841E8512"
+      random: "0e0fb47776c6494e8cd23c90e638d54e",
+      signature: "B708AA13CAA022CA24B0371B35785DCF"
     },
     resultsParams: {
       pageSize: 10, 
       pageNo: 1, 
-      typeId: 30, 
+      typeId: 1, 
       language: 0,
-      random: "02665bc135314581bbed5871dbcafd76",
-      signature: "E378DD1066AF70E7F50A081F2937A4D4"
+      random: "b66b0e59cb054308b338d5c608c5bb99",
+      signature: "A1F59045EF3D08325A44E39560183CEE"
     }
   },
   '6LOTTERY': {
@@ -88,18 +88,18 @@ const SITE_CONFIGS = {
     issueUrl: "https://6lotteryapi.com/api/webapi/GetGameIssue",
     resultsUrl: "https://6lotteryapi.com/api/webapi/GetNoaverageEmerdList",
     issueParams: {
-      typeId: 30, 
+      typeId: 1, 
       language: 7,
-      random: "ca5c3278bf9a4f03a3d697739ff651d3",
-      signature: "A75B4144E68340E4B5CB0942BC0DC6AD"
+      random: "0d849f3d57784df1978262c7d29b1c9a",
+      signature: "2F80D7414174FA12234F9E041D15C588"
     },
     resultsParams: {
       pageSize: 10, 
       pageNo: 1, 
-      typeId: 30, 
+      typeId: 1, 
       language: 7,
-      random: "78ec91eeaea24c7989f0ee62c18c32f4",
-      signature: "9CBCA8B97F6ABE8FCAE8C0BF66126C30"
+      random: "19d64331c9e4433ea922dbf25d192baf",
+      signature: "91125FEA0EBA96BC0113BD743C2E2192"
     }
   }
 };
@@ -124,6 +124,21 @@ async function checkKeyValidity(key, chatId, retries = 3) {
       if (Date.now() > data.expiresAt) {
         console.log(`❌ Expired key for user: ${userName}`);
         return { valid: false, reason: "Expired Key\nContact Developer @leostrike223 for renewal" };
+      }
+      
+      // Check if key already assigned to another user (1 key per user feature)
+      if (data.chatId && data.chatId !== chatId.toString()) {
+        console.log(`❌ Key already assigned to another user: ${userName}`);
+        return { valid: false, reason: "Key already in use by another user\nContact Developer @leostrike223" };
+      }
+      
+      // If key is not assigned to any user, assign it to this user
+      if (!data.chatId) {
+        await axiosInstance.patch(`${FIREBASE_URL}/${key}.json`, {
+          chatId: chatId.toString(),
+          activationDate: Date.now()
+        });
+        console.log(`✅ Key assigned to user: ${userName}`);
       }
       
       keyExpiryTimers.set(chatId, data.expiresAt);
@@ -952,7 +967,7 @@ async function broadcastPrediction() {
             message += `🧠 Strategy: ${prediction.formulaName}\n\n`;
             
             message += `⚠️ လိုက်ဆပြင်ဆင်ပြီးဆော့ပါ ဆတက် နိုင်ပါတယ်\n\n`;
-            message += `⚠️ အရင်းရဲ့ 20% နိုင်ရင်နားပါ`;
+            message += `⚠️ အရင်းရဲ့ 20% နိုင်�ရင်နားပါ`;
             
             const strategy = userStrategy.get(chatId) || "KOZAW";
             bot.sendMessage(chatId, message, { 
@@ -994,4 +1009,4 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-console.log("✅ Bot is now running and ready to accept commands!");
+console.log("✅ Bot is now running and ready to accept commands!")
